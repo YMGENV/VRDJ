@@ -1,0 +1,1663 @@
+<!doctype html>
+<!--
+  ============================================================================
+  AIRDECK - a two-phone AR DJ mixer (single file, static, GitHub Pages ready)
+  ============================================================================
+
+  HOW IT WORKS
+  ------------
+  Two phones open this same page and pick a role:
+
+  PLAYER PHONE
+    - Opens its camera and runs MediaPipe Hands on every frame.
+    - Shows a 5-character pairing code and a QR code.
+    - Sends the index fingertip, thumb tip, hand size and pinch state to the
+      viewer ~40 times a second over a PeerJS (WebRTC) data channel.
+
+  VIEWER PHONE
+    - Types in (or scans) the code and connects to the player with PeerJS.
+    - Shows its rear camera as the background and draws a 3D DJ deck on top
+      with Three.js. The 3D hand cursor is driven by the player's data.
+    - Pinch = press. Hold a pinch and move = drag a fader or knob.
+      Touching the screen works exactly the same way (fallback controls).
+    - ALL sound is generated/played on the viewer with the Web Audio API:
+      source -> low-pass -> high-pass -> channel gain -> crossfader gain
+      -> master gain -> compressor -> speakers.
+
+  FILE MAP (search for these banners)
+    0. CONFIG            tweakable constants
+    1. UTILITIES         tiny helpers, screen router, toast
+    2. PLAYER            camera + MediaPipe + PeerJS host
+    3. ENGINE            Web Audio graph (two decks, crossfader)
+    4. SYNTH             built-in demo tracks rendered offline in the browser
+    5. MIXER3D           Three.js deck, controls, hand cursor
+    6. INPUT             hand + touch -> one pointer model, smoothing (lerp)
+    7. NET               PeerJS client used by the viewer
+    8. LIBRARY           the "add song" modal
+    9. VIEWER            glue + render loop
+   10. BOOT              wires the buttons
+
+  DEPLOY
+    1. Put this file in a repo as index.html.
+    2. Settings > Pages > Deploy from a branch > main / root.
+    3. Open https://<you>.github.io/<repo>/ on both phones (HTTPS is required
+       for the camera, and GitHub Pages provides it).
+
+  NOTES
+    - The built-in tracks are synthesized in code, so there are no audio files,
+      no CORS problems and nothing to license.
+    - Jamendo search is optional: put a free client id in CONFIG.jamendoClientId.
+    - This is camera-passthrough AR (video + WebGL overlay), not a WebXR
+      immersive session. See the notes in the reply for why.
+  ============================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0c0e22">
+<title>Airdeck - mix with your hand</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Unbounded:wght@500;700&display=swap" rel="stylesheet">
+
+<style>
+/* ---------------------------------------------------------------------------
+   Design tokens
+   Deck A is magenta, deck B is cyan (same colors in 3D), amber = "do this".
+--------------------------------------------------------------------------- */
+:root{
+  --ink:#0c0e22; --ink-2:#161a3d;
+  --glass:rgba(255,255,255,.07); --glass-strong:rgba(16,19,48,.72); --line:rgba(255,255,255,.16);
+  --text:#eef0ff; --muted:#a3a9d6;
+  --a:#ff4d8d; --b:#3de0ff; --go:#ffc857; --bad:#ff7a7a; --ok:#5be3a1;
+  --display:"Unbounded","Arial Black",system-ui,sans-serif;
+  --body:"DM Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --st:env(safe-area-inset-top,0px); --sr:env(safe-area-inset-right,0px);
+  --sb:env(safe-area-inset-bottom,0px); --sl:env(safe-area-inset-left,0px);
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%;margin:0}
+body{background:var(--ink);color:var(--text);font:400 16px/1.45 var(--body);overflow:hidden;overscroll-behavior:none;-webkit-tap-highlight-color:transparent;-webkit-font-smoothing:antialiased}
+button,input{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:3px solid var(--go);outline-offset:3px}
+h1,h2,h3,p{margin:0}
+
+/* Glassmorphism surface used by every floating panel */
+.panel{background:var(--glass);border:1px solid var(--line);border-radius:22px;
+  backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%);
+  box-shadow:0 12px 40px rgba(0,0,0,.35)}
+
+.screen{position:fixed;inset:0;display:none;flex-direction:column}
+.screen.active{display:flex}
+
+.btn{border:1px solid var(--line);background:var(--glass);border-radius:14px;padding:.8rem 1.1rem;font-weight:700;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.btn.primary{background:var(--go);color:var(--ink);border-color:transparent}
+.btn.small{padding:.5rem .85rem;font-size:.92rem;border-radius:12px}
+.btn:active{transform:translateY(1px)}
+.link{background:none;border:0;color:var(--muted);text-decoration:underline;padding:.5rem}
+.muted{color:var(--muted)}
+
+/* ------------------------------- Role screen ---------------------------- */
+#screen-role{align-items:center;justify-content:center;padding:calc(24px + var(--st)) 22px calc(24px + var(--sb));overflow:auto}
+.role-wrap{width:min(460px,100%);display:grid;gap:22px}
+.hero{width:100%;height:auto;display:block}
+.disc{transform-box:fill-box;transform-origin:center;animation:spin 16s linear infinite}
+.disc.rev{animation-direction:reverse;animation-duration:22s}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.disc{animation:none}}
+.role-wrap h1{font:700 clamp(2.3rem,11vw,3.3rem)/1 var(--display);letter-spacing:-.03em}
+.lead{color:var(--muted);font-size:1.05rem;max-width:34ch}
+.roles{display:grid;gap:12px}
+.role{display:grid;gap:4px;text-align:left;padding:18px 20px;border-radius:20px;background:var(--glass);
+  border:1px solid var(--line);border-left:5px solid var(--go)}
+.role:hover{background:rgba(255,255,255,.12)}
+.role-title{font:700 1.1rem var(--display)}
+.role-desc{color:var(--muted)}
+.fine{color:var(--muted);font-size:.9rem}
+
+/* ------------------------------- Player screen -------------------------- */
+#screen-player{background:#05060f}
+.stage{position:absolute;inset:0}
+.stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.stage.mirror video,.stage.mirror canvas{transform:scaleX(-1)}
+.stage.dim video{opacity:.15}.stage.dim canvas{opacity:.3}
+.p-pair{position:relative;margin:calc(12px + var(--st)) 12px 0;padding:14px 16px;display:flex;gap:16px;align-items:center;justify-content:space-between}
+.p-label{color:var(--muted);font-size:.9rem}
+.code{font:700 2.1rem/1.1 var(--display);letter-spacing:.14em}
+.status{margin-top:6px;color:var(--muted)}
+.status.bad{color:var(--bad)}
+.qr{background:#fff;padding:6px;border-radius:12px;line-height:0;min-width:116px;min-height:116px;display:grid;place-items:center}
+.p-hint{position:relative;margin:12px;padding:12px 16px;color:var(--muted);transition:opacity .5s}
+.p-hint.gone{opacity:0;pointer-events:none}
+.p-bar{position:absolute;left:12px;right:12px;bottom:calc(12px + var(--sb));display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+
+/* ------------------------------- Join screen ---------------------------- */
+#screen-join{align-items:center;justify-content:center;padding:22px}
+.join-card{width:min(420px,100%);padding:24px;display:grid;gap:14px}
+.join-card h2{font:700 1.35rem/1.2 var(--display);letter-spacing:-.02em}
+.code-input{width:100%;text-align:center;font:700 2rem var(--display);letter-spacing:.2em;padding:.7rem .5rem;border-radius:16px;
+  border:1px solid var(--line);background:rgba(0,0,0,.28);text-transform:uppercase}
+.msg{min-height:1.4em;color:var(--muted)}
+.msg.bad{color:var(--bad)}
+
+/* ------------------------------- Viewer screen -------------------------- */
+#screen-viewer{background:var(--ink)}
+#screen-viewer.no-cam{background:var(--ink-2)}
+#v-video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#v-canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none}
+.hud-top{position:absolute;top:calc(10px + var(--st));left:calc(12px + var(--sl));right:calc(12px + var(--sr));display:flex;justify-content:space-between;gap:8px;pointer-events:none}
+.hud-top>*{pointer-events:auto}
+.chip{display:flex;align-items:center;gap:9px;padding:8px 14px;border-radius:999px;background:var(--glass-strong);border:1px solid var(--line);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);font-size:.92rem}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+.dot.ok{background:var(--ok)}.dot.wait{background:var(--go)}.dot.bad{background:var(--bad)}
+.hud-actions{display:flex;gap:8px}
+.v-hint{position:absolute;left:14px;right:14px;bottom:calc(14px + var(--sb));text-align:center;padding:10px 14px;border-radius:16px;
+  background:var(--glass-strong);border:1px solid var(--line);color:var(--muted);transition:opacity .6s;pointer-events:none}
+.v-hint.gone{opacity:0}
+.dom-cursor{position:fixed;left:0;top:0;width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;border:3px solid var(--go);
+  background:rgba(255,200,87,.18);pointer-events:none;z-index:60}
+
+/* ------------------------------- Song modal ----------------------------- */
+.modal{position:fixed;inset:0;z-index:50;display:flex;align-items:flex-end;justify-content:center;background:rgba(5,6,15,.55)}
+.sheet{width:min(560px,100%);max-height:88dvh;display:flex;flex-direction:column;gap:12px;padding:16px 16px calc(16px + var(--sb));
+  border-radius:26px 26px 0 0;background:var(--glass-strong)}
+.sheet-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.sheet-head h3{font:700 1.1rem var(--display);letter-spacing:-.01em}
+#m-search{width:100%;padding:.8rem 1rem;border-radius:14px;border:1px solid var(--line);background:rgba(0,0,0,.28)}
+.list{overflow:auto;display:grid;gap:8px;min-height:120px;align-content:start}
+.list h4{margin:8px 2px 0;color:var(--muted);font-weight:500;font-size:.92rem}
+.song{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;text-align:left;padding:12px 14px;border-radius:16px;
+  background:rgba(255,255,255,.06);border:1px solid var(--line)}
+.song:hover,.song.hot{background:rgba(255,255,255,.14);border-color:var(--c)}
+.swatch{width:10px;height:38px;border-radius:5px;background:var(--c)}
+.song-title{display:block;font-weight:700}
+.song-meta{display:block;color:var(--muted);font-size:.9rem}
+.song-act{color:var(--c);font-weight:700}
+.empty{color:var(--muted);padding:12px 4px}
+.btn.hot,#m-search.hot{border-color:var(--go);background:rgba(255,255,255,.16)}
+
+.toast{position:fixed;left:50%;bottom:calc(86px + var(--sb));transform:translate(-50%,10px);z-index:80;max-width:min(92vw,420px);
+  padding:10px 16px;border-radius:14px;background:var(--glass-strong);border:1px solid var(--line);opacity:0;pointer-events:none;
+  transition:opacity .25s,transform .25s;text-align:center}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+
+<body>
+
+<!-- ============================ ROLE SCREEN ============================ -->
+<section id="screen-role" class="screen active">
+  <div class="role-wrap">
+    <svg class="hero" viewBox="0 0 320 140" role="img" aria-label="Two turntables with a pinch cursor between them">
+      <g class="disc" style="color:#ff4d8d">
+        <circle cx="96" cy="70" r="60" fill="#14173a" stroke="currentColor" stroke-width="3"/>
+        <circle cx="96" cy="70" r="46" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+        <circle cx="96" cy="70" r="32" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+        <circle cx="96" cy="70" r="14" fill="currentColor"/>
+        <rect x="93" y="16" width="6" height="22" rx="3" fill="#fff"/>
+      </g>
+      <g class="disc rev" style="color:#3de0ff">
+        <circle cx="224" cy="70" r="60" fill="#14173a" stroke="currentColor" stroke-width="3"/>
+        <circle cx="224" cy="70" r="46" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+        <circle cx="224" cy="70" r="32" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+        <circle cx="224" cy="70" r="14" fill="currentColor"/>
+        <rect x="221" y="16" width="6" height="22" rx="3" fill="#fff"/>
+      </g>
+      <circle cx="160" cy="70" r="11" fill="none" stroke="#ffc857" stroke-width="3"/>
+      <circle cx="160" cy="70" r="3" fill="#ffc857"/>
+    </svg>
+
+    <div>
+      <h1>Airdeck</h1>
+      <p class="lead" style="margin-top:10px">Mix with your bare hand. One phone watches your fingers, the other shows a 3D DJ deck and plays the sound.</p>
+    </div>
+
+    <div class="roles">
+      <button class="role" id="btn-player">
+        <span class="role-title">Player phone</span>
+        <span class="role-desc">Prop it up so its camera sees your hand. It sends your pinches to the viewer.</span>
+      </button>
+      <button class="role" id="btn-viewer">
+        <span class="role-title">Viewer phone</span>
+        <span class="role-desc">Shows the 3D deck over its camera and plays all the music out loud.</span>
+      </button>
+    </div>
+    <p class="fine">Open this page on both phones. They pair with a short code, no account needed.</p>
+  </div>
+</section>
+
+<!-- ============================ PLAYER SCREEN ========================== -->
+<section id="screen-player" class="screen">
+  <div class="stage mirror" id="p-stage">
+    <video id="p-video" playsinline muted autoplay></video>
+    <canvas id="p-canvas"></canvas>
+  </div>
+
+  <header class="panel p-pair">
+    <div>
+      <div class="p-label">Pairing code</div>
+      <div id="p-code" class="code">-----</div>
+      <div id="p-status" class="status" role="status">Starting</div>
+    </div>
+    <div id="p-qr" class="qr" aria-label="QR code that opens the viewer with this code filled in"></div>
+  </header>
+
+  <div class="panel p-hint" id="p-hint">
+    Prop this phone up so the camera sees your hand inside the dashed box. Pinch your thumb and finger to press, and hold the pinch to drag.
+  </div>
+
+  <footer class="p-bar">
+    <button class="btn" id="p-flip">Flip camera</button>
+    <button class="btn" id="p-preview">Hide preview</button>
+    <button class="btn" id="p-exit">Leave</button>
+  </footer>
+</section>
+
+<!-- ============================ JOIN SCREEN ============================ -->
+<section id="screen-join" class="screen">
+  <div class="panel join-card">
+    <h2>Connect to the player phone</h2>
+    <p class="muted">Type the code shown on the player phone, or scan its QR code to open this page with the code filled in.</p>
+    <input id="join-code" class="code-input" maxlength="5" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="K7M2P" aria-label="Pairing code">
+    <button class="btn primary" id="join-go">Connect</button>
+    <div id="join-msg" class="msg" role="status"></div>
+    <button class="btn" id="join-demo">Skip pairing and use touch only</button>
+    <button class="link" id="join-back">Back</button>
+  </div>
+</section>
+
+<!-- ============================ VIEWER SCREEN ========================== -->
+<section id="screen-viewer" class="screen">
+  <video id="v-video" playsinline muted autoplay></video>
+  <canvas id="v-canvas"></canvas>
+  <div class="hud-top">
+    <div class="chip"><span id="v-dot" class="dot"></span><span id="v-status">Touch mode</span></div>
+    <div class="hud-actions">
+      <button class="btn small" id="v-reconnect" hidden>Reconnect</button>
+      <button class="btn small" id="v-exit">Leave</button>
+    </div>
+  </div>
+  <div class="v-hint" id="v-hint">Pinch to press. Hold a pinch and move to drag a fader. Touch works too.</div>
+  <div id="dom-cursor" class="dom-cursor" hidden></div>
+</section>
+
+<!-- ============================ SONG MODAL ============================= -->
+<div id="modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="m-title">
+  <div class="sheet panel">
+    <div class="sheet-head">
+      <h3 id="m-title">Add a song to Deck A</h3>
+      <button class="btn small" id="m-close" data-hand>Close</button>
+    </div>
+    <input id="m-search" type="search" placeholder="Search songs" autocomplete="off" data-hand>
+    <div id="m-list" class="list"></div>
+    <button class="btn" id="m-upload" data-hand>Choose a file from this phone</button>
+    <input id="m-file" type="file" accept="audio/*" hidden>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status"></div>
+
+<!-- ============================ LIBRARIES (CDN) ========================= -->
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+
+<script>
+(() => {
+'use strict';
+
+/* ==========================================================================
+   0. CONFIG - everything you might want to tune lives here
+   ========================================================================== */
+const CONFIG = {
+  peerPrefix: 'airdeck-',                 // namespaces our ids on the public PeerJS broker
+  codeLength: 5,
+  codeAlphabet: 'ABCDEFGHJKMNPQRSTUVWXYZ23456789',   // no I, L, O, 0, 1 to avoid typos
+  iceServers: [                           // STUN only. Add a TURN server here if some networks fail to pair.
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' }
+    // { urls: 'turn:your.turn.server:3478', username: '...', credential: '...' }
+  ],
+  mediapipeVersion: '0.4.1675469240',
+  modelComplexity: 0,                     // 0 = lite (fast on phones), 1 = full (more accurate)
+  sendIntervalMs: 25,                     // max ~40 packets per second
+  pinchOn: 0.30,                          // thumb-index gap / palm size below this = pinch starts
+  pinchOff: 0.50,                         // ...above this = pinch ends (hysteresis stops flicker)
+  // Only this part of the player camera frame maps to the viewer screen, so you never
+  // have to reach the very edge of the camera view. The player draws it as a dashed box.
+  zone: { x0: 0.12, x1: 0.88, y0: 0.12, y1: 0.88 },
+  // Cursor smoothing: rate = min + gain * distance. Slow when still (no jitter), fast when moving (no lag).
+  smoothing: { min: 9, gain: 60 },
+  handTimeoutMs: 450,                     // hand counts as lost if no packet arrives for this long
+  haptics: true,
+  jamendoClientId: ''                     // optional: free id from developer.jamendo.com enables online search
+};
+
+/* ==========================================================================
+   1. UTILITIES
+   ========================================================================== */
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const FONT_BODY = '"DM Sans", system-ui, sans-serif';
+const FONT_DISPLAY = '"Unbounded", "Arial Black", sans-serif';
+
+function show(id) {
+  document.querySelectorAll('.screen').forEach((s) => s.classList.toggle('active', s.id === id));
+}
+let toastTimer = 0;
+function toast(msg, ms = 2800) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('on'), ms);
+}
+function makeCode() {
+  const a = CONFIG.codeAlphabet;
+  const bytes = crypto.getRandomValues(new Uint8Array(CONFIG.codeLength));
+  let s = '';
+  for (const b of bytes) s += a[b % a.length];
+  return s;
+}
+function haptic(ms) { if (CONFIG.haptics && navigator.vibrate) navigator.vibrate(ms); }
+function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function leave() { location.href = location.pathname; }   // simplest reliable teardown: reload without ?join=
+
+/* ==========================================================================
+   2. PLAYER - camera, MediaPipe Hands, PeerJS host
+   --------------------------------------------------------------------------
+   Packet sent to the viewer (JSON, ~40 per second):
+     { t:'hand', p:1, x,y,z, tx,ty, s, k, r }
+       x,y   index fingertip, 0..1 across the camera frame (x is already
+             mirrored for the front camera so "right" is your right)
+       z     MediaPipe depth of the fingertip (negative = nearer the camera)
+       tx,ty thumb tip, same space
+       s     palm size / frame height (bigger = hand nearer the camera)
+       k     1 while pinching
+       r     thumb-index distance divided by palm size (the pinch ratio)
+     { t:'hand', p:0 }   when no hand is visible
+   ========================================================================== */
+const Player = (() => {
+  const video = $('p-video'), canvas = $('p-canvas'), stage = $('p-stage');
+  const g = canvas.getContext('2d');
+  let peer = null, conn = null, hands = null, cam = null;
+  let facing = 'user', mirror = true, busy = false, previewOn = true, hasError = false, tracking = false;
+  let pinching = false, lastPinchSent = false, lastSent = 0;
+  let frames = 0, fpsStamp = performance.now(), fps = 0;
+
+  // The 21 MediaPipe landmarks are joined by these bones when drawing the skeleton.
+  const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+                 [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+  function setStatus(msg, bad) { const el = $('p-status'); el.textContent = msg; el.classList.toggle('bad', !!bad); }
+  const linked = () => !!(conn && conn.open);
+  function paintStatus() {
+    if (hasError) return;
+    if (!tracking) { setStatus('Loading hand tracking'); return; }   // do not claim to be ready while the model is still loading
+    setStatus(linked() ? `Viewer connected, ${fps} fps` : 'Waiting for the viewer phone');
+  }
+
+  /* ---- PeerJS host: the player owns a predictable id so the viewer can dial it ---- */
+  function startPeer(attempt = 0) {
+    const code = makeCode();
+    const p = new Peer(CONFIG.peerPrefix + code, { debug: 1, config: { iceServers: CONFIG.iceServers } });
+    peer = p;
+    p.on('open', () => { $('p-code').textContent = code; drawQR(code); paintStatus(); });
+    p.on('connection', (c) => {
+      if (conn && conn.open) conn.close();     // newest viewer wins
+      conn = c;
+      const opened = () => { paintStatus(); haptic(30); };
+      if (c.open) opened(); else c.on('open', opened);
+      c.on('close', paintStatus);
+      c.on('error', paintStatus);
+    });
+    p.on('error', (err) => {
+      if (err.type === 'unavailable-id' && attempt < 5) { p.destroy(); startPeer(attempt + 1); }   // code collision, try another
+      else { hasError = true; setStatus(`Network problem (${err.type}). Reload to try again.`, true); }
+    });
+    p.on('disconnected', () => { try { p.reconnect(); } catch (_) {} });
+  }
+
+  function drawQR(code) {
+    const box = $('p-qr');
+    box.innerHTML = '';
+    if (typeof QRCode === 'undefined') return;
+    // Scanning opens the page with ?join=CODE, which jumps straight to the viewer pairing screen.
+    const url = location.origin + location.pathname + '?join=' + code;
+    new QRCode(box, { text: url, width: 104, height: 104, colorDark: '#0c0e22', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.M });
+  }
+
+  /* ---- Camera + MediaPipe ---- */
+  async function startCamera() {
+    if (cam) { try { await cam.stop(); } catch (_) {} cam = null; }
+    stage.classList.toggle('mirror', mirror);
+    cam = new Camera(video, {
+      facingMode: facing, width: 640, height: 480,
+      onFrame: async () => {
+        if (busy || !hands) return;            // never queue frames: drop them to stay real-time
+        busy = true;
+        try { await hands.send({ image: video }); } catch (e) { console.warn(e); } finally { busy = false; }
+      }
+    });
+    await cam.start();
+  }
+
+  async function start() {
+    show('screen-player');
+    startPeer();
+    try {
+      setStatus('Loading hand tracking');
+      hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${CONFIG.mediapipeVersion}/${f}` });
+      hands.setOptions({ maxNumHands: 1, modelComplexity: CONFIG.modelComplexity, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+      hands.onResults(onResults);
+      await hands.initialize();
+      await startCamera();
+      tracking = true;
+      paintStatus();
+    } catch (err) {
+      console.error(err);
+      hasError = true;
+      setStatus(err && err.name === 'NotAllowedError'
+        ? 'Camera blocked. Allow camera access for this site, then reload.'
+        : 'Could not start the camera or the hand model. Check your connection and reload.', true);
+    }
+  }
+
+  function onResults(res) {
+    const W = video.videoWidth, H = video.videoHeight;
+    if (!W) return;
+    if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+    g.clearRect(0, 0, W, H);
+    if (previewOn) drawZone(W, H);
+
+    frames++;
+    const now = performance.now();
+    if (now - fpsStamp >= 1000) { fps = frames; frames = 0; fpsStamp = now; paintStatus(); }
+
+    const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
+    if (!lm) { pinching = false; send({ t: 'hand', p: 0 }, false); lastPinchSent = false; return; }
+
+    const thumb = lm[4], index = lm[8], wrist = lm[0], midMcp = lm[9];
+    // Measure in pixels (not 0..1) so the image aspect ratio does not distort distances.
+    const dist = (a, b) => Math.hypot((a.x - b.x) * W, (a.y - b.y) * H);
+    const palm = dist(wrist, midMcp) || 1;
+    const ratio = dist(thumb, index) / palm;
+
+    if (!pinching && ratio < CONFIG.pinchOn) pinching = true;
+    else if (pinching && ratio > CONFIG.pinchOff) pinching = false;
+
+    const mx = (v) => (mirror ? 1 - v : v);    // selfie camera: flip x so the cursor follows your hand like a mirror
+    send({
+      t: 'hand', p: 1,
+      x: r3(mx(index.x)), y: r3(index.y), z: r3(index.z),
+      tx: r3(mx(thumb.x)), ty: r3(thumb.y),
+      s: r3(palm / H), k: pinching ? 1 : 0, r: r3(ratio)
+    }, pinching !== lastPinchSent);            // pinch changes bypass the rate limit so clicks are never delayed
+    lastPinchSent = pinching;
+
+    if (previewOn) drawHand(lm, W, H);
+    if (pinching) $('p-hint').classList.add('gone');
+  }
+
+  function send(obj, force) {
+    if (!linked()) return;
+    const now = performance.now();
+    if (!force && now - lastSent < CONFIG.sendIntervalMs) return;
+    lastSent = now;
+    try { conn.send(obj); } catch (_) {}
+  }
+
+  function drawZone(W, H) {
+    const z = CONFIG.zone;
+    g.save();
+    g.setLineDash([14, 10]); g.lineWidth = Math.max(2, W / 240); g.strokeStyle = 'rgba(255,255,255,.4)';
+    g.strokeRect(z.x0 * W, z.y0 * H, (z.x1 - z.x0) * W, (z.y1 - z.y0) * H);
+    g.restore();
+  }
+  function drawHand(lm, W, H) {
+    g.lineWidth = Math.max(2, W / 160); g.lineCap = 'round'; g.strokeStyle = 'rgba(255,255,255,.75)';
+    g.beginPath();
+    for (const [a, b] of BONES) { g.moveTo(lm[a].x * W, lm[a].y * H); g.lineTo(lm[b].x * W, lm[b].y * H); }
+    g.stroke();
+    const r = Math.max(5, W / 70);
+    for (const i of [4, 8]) {
+      g.beginPath(); g.fillStyle = pinching ? '#ffc857' : '#3de0ff';
+      g.arc(lm[i].x * W, lm[i].y * H, r, 0, Math.PI * 2); g.fill();
+    }
+  }
+
+  // Keepalive: lets the viewer notice quickly if this phone locks, loses signal or closes the tab.
+  setInterval(() => { if (linked()) { try { conn.send({ t: 'ping' }); } catch (_) {} } }, 1000);
+
+  $('p-flip').addEventListener('click', async () => {
+    facing = facing === 'user' ? 'environment' : 'user';
+    mirror = facing === 'user';
+    try { await startCamera(); } catch (_) { toast('Could not switch cameras.'); }
+  });
+  $('p-preview').addEventListener('click', () => {
+    previewOn = !previewOn;
+    stage.classList.toggle('dim', !previewOn);
+    if (!previewOn) g.clearRect(0, 0, canvas.width, canvas.height);
+    $('p-preview').textContent = previewOn ? 'Hide preview' : 'Show preview';
+  });
+  $('p-exit').addEventListener('click', leave);
+
+  return { start };
+})();
+
+/* ==========================================================================
+   3. ENGINE - the Web Audio graph (lives on the VIEWER only)
+   --------------------------------------------------------------------------
+   Per deck:
+     BufferSource -> lowpass -> highpass -> volume -> crossfade gain -> master
+                                                      \-> analyser (glow)
+   Master: gain -> compressor (safety limiter) -> speakers
+   ========================================================================== */
+const Engine = (() => {
+  let ctx = null, master = null;
+  const decks = {};
+
+  class DeckAudio {
+    constructor() {
+      this.lpf = ctx.createBiquadFilter(); this.lpf.type = 'lowpass';  this.lpf.frequency.value = 20000; this.lpf.Q.value = 0.8;
+      this.hpf = ctx.createBiquadFilter(); this.hpf.type = 'highpass'; this.hpf.frequency.value = 20;    this.hpf.Q.value = 0.8;
+      this.vol = ctx.createGain();
+      this.xf = ctx.createGain();
+      this.an = ctx.createAnalyser(); this.an.fftSize = 256;
+      this.lpf.connect(this.hpf); this.hpf.connect(this.vol); this.vol.connect(this.xf);
+      this.xf.connect(master); this.xf.connect(this.an);
+      this.tbuf = new Uint8Array(this.an.fftSize);
+      this.buffer = null; this.src = null; this.title = '';
+      this.playing = false; this.loop = true; this.pos = 0; this.rate = 1; this.last = 0;
+      this.onChange = null;
+    }
+    load(buffer, title, loop) {
+      if (this.playing) this.pause();
+      this.buffer = buffer; this.title = title; this.loop = loop; this.pos = 0;
+      if (this.onChange) this.onChange();
+    }
+    play() {
+      if (!this.buffer || this.playing) return;
+      Engine.resume();
+      const s = ctx.createBufferSource();
+      s.buffer = this.buffer; s.loop = this.loop; s.playbackRate.value = this.rate;
+      s.connect(this.lpf);
+      s.start(0, this.pos % this.buffer.duration);
+      s.onended = () => {                       // only fires on its own for non-looping songs
+        if (this.src === s && !this.loop) { this.src = null; this.playing = false; this.pos = 0; if (this.onChange) this.onChange(); }
+      };
+      this.src = s; this.playing = true; this.last = ctx.currentTime;
+      if (this.onChange) this.onChange();
+    }
+    pause() {
+      if (!this.playing) return;
+      this.tick();
+      const s = this.src; s.onended = null;
+      try { s.stop(); } catch (_) {}
+      s.disconnect(); this.src = null; this.playing = false;
+      if (this.onChange) this.onChange();
+    }
+    toggle() { if (!this.buffer) return; if (this.playing) this.pause(); else this.play(); }
+    // Keep our own playhead using the audio clock so we can resume from the right spot.
+    tick() {
+      if (!this.playing || !this.buffer) return;
+      const now = ctx.currentTime;
+      this.pos += (now - this.last) * this.rate; this.last = now;
+      const d = this.buffer.duration;
+      this.pos = this.loop ? this.pos % d : Math.min(this.pos, d);
+    }
+    progress() { return this.buffer ? clamp(this.pos / this.buffer.duration, 0, 1) : 0; }
+    setVolume(v) { this.vol.gain.setTargetAtTime(v * v, ctx.currentTime, 0.02); }   // squared = audio-style fader taper
+    // "Pitch" here is vinyl-style: playbackRate changes tempo AND pitch together, like a turntable pitch fader.
+    setRate(r) {
+      this.rate = r;
+      if (this.src) this.src.playbackRate.setTargetAtTime(r, ctx.currentTime, 0.03);
+    }
+    // One knob, two filters (the classic DJ "filter"):
+    //   left of center  -> low-pass sweeps down (muffled)
+    //   right of center -> high-pass sweeps up (thin)
+    //   center          -> both bypassed
+    setFilter(f) {
+      const t = ctx.currentTime;
+      let lp = 20000, hp = 20;
+      if (f < -0.04) lp = 20000 * Math.pow(0.01, (-f - 0.04) / 0.96);      // 20 kHz .. 200 Hz
+      else if (f > 0.04) hp = 20 * Math.pow(250, (f - 0.04) / 0.96);       // 20 Hz .. 5 kHz
+      this.lpf.frequency.setTargetAtTime(lp, t, 0.02);
+      this.hpf.frequency.setTargetAtTime(hp, t, 0.02);
+    }
+    level() {
+      this.an.getByteTimeDomainData(this.tbuf);
+      let sum = 0;
+      for (let i = 0; i < this.tbuf.length; i++) { const v = (this.tbuf[i] - 128) / 128; sum += v * v; }
+      return clamp(Math.sqrt(sum / this.tbuf.length) * 3, 0, 1);
+    }
+  }
+
+  function init() {
+    if (ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    ctx = new AC({ latencyHint: 'interactive' });
+    // iOS: make Web Audio ignore the silent switch (Safari 16.4+).
+    if (navigator.audioSession) { try { navigator.audioSession.type = 'playback'; } catch (_) {} }
+    master = ctx.createGain(); master.gain.value = 0.9;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -10; comp.knee.value = 12; comp.ratio.value = 8; comp.attack.value = 0.003; comp.release.value = 0.2;
+    master.connect(comp); comp.connect(ctx.destination);
+    decks.A = new DeckAudio();
+    decks.B = new DeckAudio();
+    setCrossfade(0.5);
+  }
+  // Equal-power crossfade: constant loudness across the whole travel of the fader.
+  function setCrossfade(c) {
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    decks.A.xf.gain.setTargetAtTime(Math.cos(c * Math.PI / 2), t, 0.02);
+    decks.B.xf.gain.setTargetAtTime(Math.sin(c * Math.PI / 2), t, 0.02);
+  }
+  function resume() { if (ctx && ctx.state !== 'running') ctx.resume(); }
+  function tick() { if (ctx) { decks.A.tick(); decks.B.tick(); } }
+  function decode(arrayBuffer) { return new Promise((res, rej) => ctx.decodeAudioData(arrayBuffer, res, rej)); }
+
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) resume(); });
+  return { init, resume, tick, setCrossfade, decode, deck: (id) => decks[id] };
+})();
+
+/* ==========================================================================
+   4. SYNTH - built-in demo tracks
+   --------------------------------------------------------------------------
+   Four short loops (8 bars each) are rendered on demand with an
+   OfflineAudioContext: drums from oscillators + noise, saw basses, pads, arps.
+   Nothing is downloaded, so it works offline and there is nothing to license.
+   Each track is described by a few 16-step patterns.
+   ========================================================================== */
+const Synth = (() => {
+  const P = (s) => s.split('').map(Number);                       // '1010' -> [1,0,1,0]
+  const CHORDS = { min: [0, 3, 7], maj: [0, 4, 7], min7: [0, 3, 7, 10], maj7: [0, 4, 7, 11] };
+  const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+  // root = MIDI note of the key, chords = [semitones from root, chord type] per bar
+  const TRACKS = [
+    { id: 'neon', title: 'Neon Drive', genre: 'Synthwave', bpm: 100, root: 45, bars: 8,
+      chords: [{ r: 0, type: 'min' }, { r: -4, type: 'maj' }, { r: 3, type: 'maj' }, { r: -2, type: 'maj' }],
+      kick: P('1000000010000010'), snare: P('0000100000001000'), hat: P('1010101010101010'),
+      bass: P('1010201010102010'), arp: [0,1,2,3,2,1,0,1,2,3,4,3,2,1,2,1], pad: 0.9, bassWave: 'sawtooth', bassCut: 700, bassVol: 0.3 },
+    { id: 'pulse', title: 'Midnight Pulse', genre: 'House', bpm: 124, root: 41, bars: 8,
+      chords: [{ r: 0, type: 'min7' }, { r: -4, type: 'maj7' }, { r: 3, type: 'maj7' }, { r: -2, type: 'maj' }],
+      kick: P('1000100010001000'), clap: P('0000100000001000'), hat: P('1020102010201020'),
+      bass: P('0010001000100020'), stab: P('0010000000100010'), pad: 0.5, bassWave: 'sawtooth', bassCut: 500, bassVol: 0.34 },
+    { id: 'sunset', title: 'Chrome Sunset', genre: 'Downtempo', bpm: 88, root: 38, bars: 8,
+      chords: [{ r: 0, type: 'min7' }, { r: -4, type: 'maj7' }, { r: 3, type: 'maj7' }, { r: -2, type: 'maj7' }],
+      kick: P('1000001000100000'), snare: P('0000100000001000'), hat: P('1010101010101010'),
+      bass: P('1000000010000010'), arp: [0,null,2,null,1,null,null,3,null,2,null,null,1,null,3,null], pad: 1, bassWave: 'triangle', bassCut: 600, bassVol: 0.4 },
+    { id: 'grid', title: 'Laser Grid', genre: 'Electro', bpm: 130, root: 40, bars: 8,
+      chords: [{ r: 0, type: 'min' }, { r: 0, type: 'min' }, { r: -2, type: 'maj' }, { r: -4, type: 'maj' }],
+      kick: P('1000100010001000'), clap: P('0000100000001000'), hat: P('1011101110111011'),
+      bass: P('1121112111211121'), arp: [0,null,1,null,2,null,1,null,0,null,1,null,2,null,3,null], pad: 0.3, bassWave: 'sawtooth', bassCut: 1100, bassVol: 0.28 }
+  ];
+
+  async function render(def) {
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const sr = 44100, beat = 60 / def.bpm, step = beat / 4, dur = def.bars * 4 * beat;
+    const oc = new OAC(2, Math.ceil(dur * sr), sr);
+
+    const out = oc.createGain();
+    const comp = oc.createDynamicsCompressor();
+    out.connect(comp); comp.connect(oc.destination);
+    // Tiny fades at both ends so the loop point does not click.
+    out.gain.setValueAtTime(0, 0); out.gain.linearRampToValueAtTime(0.9, 0.004);
+    out.gain.setValueAtTime(0.9, dur - 0.012); out.gain.linearRampToValueAtTime(0, dur);
+
+    // Deterministic white noise (same result every render).
+    const nb = oc.createBuffer(1, sr, sr), nd = nb.getChannelData(0);
+    let seed = 1337;
+    for (let i = 0; i < nd.length; i++) { seed = (seed * 1664525 + 1013904223) >>> 0; nd[i] = (seed / 4294967296) * 2 - 1; }
+
+    /* --- instruments --- */
+    function kick(t) {
+      const o = oc.createOscillator(), g = oc.createGain();
+      o.frequency.setValueAtTime(150, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.14);
+      g.gain.setValueAtTime(1, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+      o.connect(g); g.connect(out); o.start(t); o.stop(t + 0.4);
+    }
+    function noise(t, len, type, freq, vol, q) {
+      const s = oc.createBufferSource(); s.buffer = nb;
+      const f = oc.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q || 0.7;
+      const g = oc.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + len);
+      s.connect(f); f.connect(g); g.connect(out); s.start(t, 0); s.stop(t + len + 0.02);
+    }
+    function snare(t) {
+      noise(t, 0.18, 'bandpass', 1900, 0.55, 0.8);
+      const o = oc.createOscillator(), g = oc.createGain(); o.type = 'triangle'; o.frequency.setValueAtTime(200, t);
+      g.gain.setValueAtTime(0.35, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+      o.connect(g); g.connect(out); o.start(t); o.stop(t + 0.12);
+    }
+    function clap(t) { [0, 0.012, 0.026].forEach((d) => noise(t + d, 0.05, 'bandpass', 1500, 0.4, 1.2)); noise(t + 0.03, 0.2, 'bandpass', 1500, 0.3, 1.2); }
+    function hat(t, open) { noise(t, open ? 0.22 : 0.05, 'highpass', 8000, open ? 0.2 : 0.16, 0.7); }
+
+    // One synth note: oscillator -> low-pass sweep -> envelope -> (pan) -> bus
+    function voice(type, freq, t, len, o) {
+      const osc = oc.createOscillator(); osc.type = type; osc.frequency.value = freq;
+      if (o.detune) osc.detune.value = o.detune;
+      const f = oc.createBiquadFilter(); f.type = 'lowpass'; f.Q.value = o.q || 1;
+      f.frequency.setValueAtTime(o.c0 || 2000, t); f.frequency.exponentialRampToValueAtTime(Math.max(60, o.c1 || 800), t + len);
+      const a = o.a || 0.005, r = o.r || 0.08, g = oc.createGain();
+      g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(o.vol, t + a);
+      g.gain.setValueAtTime(o.vol, Math.max(t + a + 0.001, t + len)); g.gain.exponentialRampToValueAtTime(0.0001, t + len + r);
+      osc.connect(f); f.connect(g);
+      const dest = o.bus || out;
+      if (o.pan !== undefined && oc.createStereoPanner) { const p = oc.createStereoPanner(); p.pan.value = o.pan; g.connect(p); p.connect(dest); }
+      else g.connect(dest);
+      osc.start(t); osc.stop(t + len + r + 0.05);
+    }
+
+    // Arps go through a ping-pong-ish feedback delay for that synthwave shimmer.
+    const arpBus = oc.createGain(); arpBus.connect(out);
+    if (def.arp) {
+      const d = oc.createDelay(1.5); d.delayTime.value = beat * 0.75;
+      const fb = oc.createGain(); fb.gain.value = 0.38;
+      const wet = oc.createGain(); wet.gain.value = 0.35;
+      arpBus.connect(d); d.connect(fb); fb.connect(d); d.connect(wet); wet.connect(out);
+    }
+
+    /* --- sequence the whole loop --- */
+    for (let bar = 0; bar < def.bars; bar++) {
+      const ch = def.chords[bar % def.chords.length], iv = CHORDS[ch.type], rootM = def.root + ch.r, t0 = bar * 4 * beat;
+      if (def.pad) {
+        iv.forEach((semi) => [[-7, -0.5], [7, 0.5]].forEach(([det, pan]) =>
+          voice('sawtooth', mtof(rootM + 12 + semi), t0, 4 * beat * 0.98,
+                { vol: def.pad * 0.06, a: 0.25, r: 0.4, c0: 1200, c1: 1200, q: 0.7, detune: det, pan })));
+      }
+      for (let s = 0; s < 16; s++) {
+        const t = t0 + s * step;
+        if (def.kick[s]) kick(t);
+        if (def.snare && def.snare[s]) snare(t);
+        if (def.clap && def.clap[s]) clap(t);
+        if (def.hat[s]) hat(t, def.hat[s] === 2);
+        const b = def.bass[s];
+        if (b) voice(def.bassWave, mtof(rootM + (b === 2 ? 12 : 0)), t, step * 0.9, { vol: def.bassVol, c0: def.bassCut, c1: 200, q: 6, a: 0.004, r: 0.05 });
+        if (def.stab && def.stab[s]) iv.forEach((semi) => voice('square', mtof(rootM + 12 + semi), t, step * 1.4, { vol: 0.05, c0: 3000, c1: 900, q: 1 }));
+        if (def.arp) {
+          const a = def.arp[s];
+          if (a !== null && a !== undefined) {
+            const semi = iv[a % iv.length] + 12 * Math.floor(a / iv.length);
+            voice('sawtooth', mtof(rootM + 24 + semi), t, step * 0.8, { vol: 0.07, c0: 5000, c1: 900, q: 3, a: 0.003, r: 0.06, bus: arpBus });
+          }
+        }
+      }
+    }
+
+    const buf = await oc.startRendering();
+    // Normalise so every built-in loop has the same loudness.
+    let peak = 0;
+    for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; } }
+    const k = peak > 0 ? 0.89 / peak : 1;
+    for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= k; }
+    return buf;
+  }
+  return { TRACKS, render };
+})();
+
+/* ==========================================================================
+   5. MIXER3D - the Three.js deck
+   --------------------------------------------------------------------------
+   Layout (deck-local units, +y up, +z toward the viewer):
+
+        [ platter A ]   [ platter B ]
+        [ title A   ]   [ title B   ]
+        [ Add song A]   [ Add song B]
+        [ Play      ]   [ Play      ]       <- these rise out of the deck once a
+        [vol pitch fil] [vol pitch fil]        song is loaded
+        [        crossfader          ]
+
+   Everything you can touch has a transparent "hit" plane. Both touch and the
+   hand cursor ray-cast against those planes, so there is ONE interaction path.
+   ========================================================================== */
+const Mixer3D = (() => {
+  const W = 3.8, H = 5.8, TILT = -0.3;
+  const COLOR = { A: 0xff4d8d, B: 0x3de0ff };
+  const CSSC = { A: '#ff4d8d', B: '#3de0ff' };
+  const hitMeshes = [], controls = [], faces = [], decks = {};
+  const HIT_MAT = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide });
+  const plane = new THREE.Plane(), raycaster = new THREE.Raycaster(), planeNormalW = new THREE.Vector3(0, 0, 1);
+  let renderer, scene, camera, root, cb = {};
+  let cursor, cursorMat, shadow, cursorScale = 1;
+  let xf = null;
+
+  /* ---------- canvas-drawn text/UI faces (crisp labels without font geometry) ---------- */
+  function rr(cx, x, y, w, h, r) {
+    cx.beginPath(); cx.moveTo(x + r, y);
+    cx.arcTo(x + w, y, x + w, y + h, r); cx.arcTo(x + w, y + h, x, y + h, r);
+    cx.arcTo(x, y + h, x, y, r); cx.arcTo(x, y, x + w, y, r); cx.closePath();
+  }
+  function fitFont(cx, str, weight, size, maxW) {
+    let s = size; cx.font = `${weight} ${s}px ${FONT_BODY}`;
+    while (cx.measureText(str).width > maxW && s > size * 0.5) { s -= 1; cx.font = `${weight} ${s}px ${FONT_BODY}`; }
+    return s;
+  }
+  function ellipsize(cx, str, maxW) {
+    if (cx.measureText(str).width <= maxW) return str;
+    while (str.length > 1 && cx.measureText(str + '...').width > maxW) str = str.slice(0, -1);
+    return str + '...';
+  }
+
+  class Face {
+    constructor(w, h, ppu) {
+      this.w = w; this.h = h; this.ppu = ppu;
+      this.cv = document.createElement('canvas');
+      this.cv.width = Math.round(w * ppu); this.cv.height = Math.round(h * ppu);
+      this.cx = this.cv.getContext('2d');
+      this.tex = new THREE.CanvasTexture(this.cv);
+      this.tex.minFilter = THREE.LinearFilter; this.tex.generateMipmaps = false;
+      this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: this.tex, transparent: true, depthWrite: false }));
+      this.painter = null;
+      faces.push(this);
+    }
+    paint(fn) { this.painter = fn; this.redraw(); }
+    redraw() {
+      const { cx, cv } = this;
+      cx.clearRect(0, 0, cv.width, cv.height);
+      if (this.painter) this.painter(cx, cv.width, cv.height);
+      this.tex.needsUpdate = true;
+    }
+  }
+
+  function makeHit(w, h, control) {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), HIT_MAT);
+    m.position.z = 0.15; m.userData.control = control; hitMeshes.push(m);
+    return m;
+  }
+
+  /* ---------- controls. Interface used by INPUT: isActive, setHover, down, drag, up ---------- */
+  class Button {
+    constructor({ w, h, color, label, solid = false, onPress, isActive = () => true }) {
+      Object.assign(this, { w, h, color, label, solid, onPress, _active: isActive, hovering: false, pressed: false });
+      this.group = new THREE.Group();
+      this.face = new Face(w, h, 260);
+      this.group.add(this.face.mesh);
+      this.hit = makeHit(w + 0.08, h + 0.06, this);
+      this.group.add(this.hit);
+      controls.push(this);
+      this.render();
+    }
+    isActive() { return this._active(); }
+    set(opts) { Object.assign(this, opts); this.render(); }
+    setHover(b) { if (b !== this.hovering) { this.hovering = b; this.render(); } }
+    render() {
+      this.face.paint((cx, pw, ph) => {
+        rr(cx, 3, 3, pw - 6, ph - 6, (ph - 6) * 0.34);
+        cx.fillStyle = this.solid ? this.color : 'rgba(255,255,255,0.09)'; cx.fill();
+        if (this.hovering) { cx.fillStyle = 'rgba(255,255,255,0.22)'; cx.fill(); }
+        if (this.pressed) { cx.fillStyle = 'rgba(0,0,0,0.28)'; cx.fill(); }
+        cx.lineWidth = 4; cx.strokeStyle = this.hovering ? '#ffffff' : this.color; cx.stroke();
+        cx.fillStyle = this.solid ? '#0c0e22' : '#ffffff';
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        fitFont(cx, this.label, '700', Math.round(ph * 0.42), pw * 0.86);
+        cx.fillText(this.label, pw / 2, ph / 2 + 2);
+      });
+    }
+    // Hand pinches fire on press (feels instant); touch/mouse fire on release (lets you slide off to cancel).
+    down(world, ptr) {
+      this.pressed = true; this.group.scale.setScalar(0.95); this.render();
+      if (ptr.fire === 'down') this.fire();
+    }
+    drag() {}
+    up(ptr) {
+      const was = this.pressed;
+      this.pressed = false; this.group.scale.setScalar(1); this.render();
+      if (was && ptr.fire === 'up' && pickAt(ptr.ndc).control === this) this.fire();
+    }
+    fire() { haptic(14); this.onPress(); }
+  }
+
+  class Slider {
+    constructor({ axis = 'y', length = 1.2, color, value = 0.5, def = 0.5, fill = true, ticks = [], handle = [0.36, 0.18], onChange, isActive = () => true }) {
+      Object.assign(this, { axis, length, value, def, onChange, _active: isActive, hovering: false, grab: 0, locked: false, _t: 0 });
+      const vertical = axis === 'y';
+      this.group = new THREE.Group();
+      const track = new THREE.Mesh(
+        vertical ? new THREE.BoxGeometry(0.07, length, 0.04) : new THREE.BoxGeometry(length, 0.07, 0.04),
+        new THREE.MeshStandardMaterial({ color: 0x070918, roughness: 0.8 }));
+      track.position.z = 0.02; this.group.add(track);
+      this.fillMesh = null;
+      if (fill) {
+        this.fillMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.07, 1), new THREE.MeshBasicMaterial({ color }));
+        this.fillMesh.position.z = 0.045; this.group.add(this.fillMesh);
+      }
+      ticks.forEach((t) => {
+        const m = new THREE.Mesh(new THREE.PlaneGeometry(vertical ? 0.3 : 0.02, vertical ? 0.02 : 0.3),
+          new THREE.MeshBasicMaterial({ color: 0x6e76b8, transparent: true, opacity: 0.7 }));
+        const p = -length / 2 + t * length;
+        m.position.set(vertical ? 0 : p, vertical ? p : 0, 0.045); this.group.add(m);
+      });
+      this.handle = new THREE.Mesh(new THREE.BoxGeometry(handle[0], handle[1], 0.09),
+        new THREE.MeshStandardMaterial({ color: 0xe9ecff, roughness: 0.35, metalness: 0.2 }));
+      const stripe = new THREE.Mesh(new THREE.PlaneGeometry(vertical ? handle[0] * 0.8 : 0.03, vertical ? 0.03 : handle[1] * 0.8), new THREE.MeshBasicMaterial({ color }));
+      stripe.position.z = 0.047; this.handle.add(stripe);
+      this.group.add(this.handle);
+      this.hit = makeHit(vertical ? 0.46 : length + 0.3, vertical ? length + 0.2 : 0.62, this);
+      this.group.add(this.hit);
+      controls.push(this);
+      this.setValue(value, true);
+    }
+    isActive() { return this._active(); }
+    setHover(b) { if (b !== this.hovering) { this.hovering = b; this.handle.material.emissive.setHex(b ? 0x555555 : 0x000000); } }
+    setValue(v, silent) {
+      v = clamp(v, 0, 1); this.value = v;
+      const p = -this.length / 2 + v * this.length;
+      if (this.axis === 'y') {
+        this.handle.position.set(0, p, 0.09);
+        if (this.fillMesh) { const h = Math.max(0.001, v * this.length); this.fillMesh.scale.y = h; this.fillMesh.position.y = -this.length / 2 + h / 2; }
+      } else this.handle.position.set(p, 0, 0.09);
+      if (!silent && this.onChange) this.onChange(v);
+    }
+    axisOf(world) { const lp = this.group.worldToLocal(world.clone()); return this.axis === 'y' ? lp.y : lp.x; }
+    down(world) {
+      const now = performance.now();
+      if (now - this._t < 320) { this.setValue(this.def); this.locked = true; this._t = 0; haptic(20); return; }   // double tap/pinch = reset
+      this._t = now; this.locked = false;
+      const a = this.axisOf(world), hp = -this.length / 2 + this.value * this.length;
+      this.grab = Math.abs(a - hp) < 0.26 ? hp - a : 0;     // grabbing the handle: no jump. Pressing the track: jump there.
+      this.drag(world);
+    }
+    drag(world) { if (!this.locked) this.setValue((this.axisOf(world) + this.grab + this.length / 2) / this.length); }
+    up() { this.locked = false; }
+  }
+
+  class Knob {
+    constructor({ radius = 0.2, color, value = 0.5, def = 0.5, onChange, isActive = () => true }) {
+      Object.assign(this, { radius, value, def, onChange, _active: isActive, hovering: false, locked: false, _t: 0, sy: 0, sv: 0 });
+      this.group = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, 0.1, 36),
+        new THREE.MeshStandardMaterial({ color: 0x0f1230, metalness: 0.5, roughness: 0.4 }));
+      body.rotation.x = Math.PI / 2; body.position.z = 0.05; this.group.add(body); this.body = body;
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(radius + 0.018, 0.012, 8, 40), new THREE.MeshBasicMaterial({ color }));
+      ring.position.z = 0.05; this.group.add(ring);
+      for (let i = 0; i < 7; i++) {                      // scale dots from -135deg to +135deg
+        const a = (0.5 - i / 6) * Math.PI * 1.5 + Math.PI / 2;
+        const dot = new THREE.Mesh(new THREE.CircleGeometry(0.014, 8), new THREE.MeshBasicMaterial({ color: 0x6e76b8 }));
+        dot.position.set(Math.cos(a) * (radius + 0.07), Math.sin(a) * (radius + 0.07), 0.02); this.group.add(dot);
+      }
+      this.wrap = new THREE.Group(); this.wrap.position.z = 0.105; this.group.add(this.wrap);
+      const ind = new THREE.Mesh(new THREE.BoxGeometry(0.04, radius * 0.8, 0.02), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+      ind.position.y = radius * 0.45; this.wrap.add(ind);
+      this.hit = makeHit(0.48, 0.5, this); this.group.add(this.hit);
+      controls.push(this);
+      this.setValue(value, true);
+    }
+    isActive() { return this._active(); }
+    setHover(b) { if (b !== this.hovering) { this.hovering = b; this.body.material.emissive.setHex(b ? 0x333333 : 0x000000); } }
+    setValue(v, silent) {
+      v = clamp(v, 0, 1); this.value = v;
+      this.wrap.rotation.z = (0.5 - v) * Math.PI * 1.5;
+      if (!silent && this.onChange) this.onChange(v);
+    }
+    down(world) {
+      const now = performance.now();
+      if (now - this._t < 320) { this.setValue(this.def); this.locked = true; this._t = 0; haptic(20); return; }
+      this._t = now; this.locked = false;
+      this.sy = this.group.worldToLocal(world.clone()).y; this.sv = this.value;
+    }
+    drag(world) {                                         // drag up = turn right, drag down = turn left
+      if (this.locked) return;
+      this.setValue(this.sv + (this.group.worldToLocal(world.clone()).y - this.sy) / 1.1);
+    }
+    up() { this.locked = false; }
+  }
+
+  class Caption {
+    constructor(w, h) { this.face = new Face(w, h, 260); this.mesh = this.face.mesh; this.a = ''; this.b = ''; this.paint(); }
+    set(a, b) { if (a === this.a && b === this.b) return; this.a = a; this.b = b; this.paint(); }
+    paint() {
+      this.face.paint((cx, pw, ph) => {
+        cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.fillStyle = '#a3a9d6'; fitFont(cx, this.a, '500', Math.round(ph * 0.3), pw * 0.98); cx.fillText(this.a, pw / 2, ph * 0.3);
+        if (this.b) { cx.fillStyle = '#ffffff'; fitFont(cx, this.b, '700', Math.round(ph * 0.27), pw * 0.98); cx.fillText(this.b, pw / 2, ph * 0.68); }
+      });
+    }
+  }
+
+  /* ---------- building one deck (A or B) ---------- */
+  function buildDeck(id, x) {
+    const col = COLOR[id], css = CSSC[id];
+    const g = new THREE.Group(); g.position.x = x; root.add(g);
+    const d = { id, loaded: false, playing: false, reveal: 0, spin: 0, rate: 1, level: 0, title: 'No song yet', progress: 0, dirty: true, _tp: 0 };
+    decks[id] = d;
+
+    // Turntable: fixed outer ring + spinning platter with a marker so rotation is obvious.
+    const plat = new THREE.Group(); plat.position.y = 2.0; g.add(plat);
+    d.ring = new THREE.Mesh(new THREE.TorusGeometry(0.77, 0.03, 12, 72),
+      new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.4, roughness: 0.4 }));
+    d.ring.position.z = 0.04; plat.add(d.ring);
+    const disc = new THREE.Mesh(new THREE.CylinderGeometry(0.72, 0.72, 0.06, 56), new THREE.MeshStandardMaterial({ color: 0x0a0b1b, metalness: 0.6, roughness: 0.35 }));
+    disc.rotation.x = Math.PI / 2; disc.position.z = 0.03; plat.add(disc);
+    d.spinGroup = new THREE.Group(); d.spinGroup.position.z = 0.065; plat.add(d.spinGroup);
+    [0.62, 0.48, 0.34].forEach((r) => d.spinGroup.add(new THREE.Mesh(new THREE.RingGeometry(r, r + 0.006, 64), new THREE.MeshBasicMaterial({ color: 0x2a3066 }))));
+    const lab = new THREE.Mesh(new THREE.CircleGeometry(0.22, 40), new THREE.MeshStandardMaterial({ color: col, roughness: 0.5 })); lab.position.z = 0.002; d.spinGroup.add(lab);
+    const mark = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.3, 0.012), new THREE.MeshBasicMaterial({ color: 0xffffff })); mark.position.set(0, 0.5, 0.004); d.spinGroup.add(mark);
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      const dot = new THREE.Mesh(new THREE.CircleGeometry(0.018, 10), new THREE.MeshBasicMaterial({ color: 0x4a53a0 }));
+      dot.position.set(Math.cos(a) * 0.66, Math.sin(a) * 0.66, 0.004); d.spinGroup.add(dot);
+    }
+    const letter = new Face(0.4, 0.4, 200);
+    letter.paint((cx, pw, ph) => { cx.fillStyle = '#0c0e22'; cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.font = `700 ${Math.round(ph * 0.5)}px ${FONT_DISPLAY}`; cx.fillText(id, pw / 2, ph / 2 + 2); });
+    letter.mesh.position.z = 0.09; plat.add(letter.mesh);
+
+    // Song title + progress bar
+    d.titleFace = new Face(1.7, 0.36, 260); d.titleFace.mesh.position.set(0, 1.02, 0.01); g.add(d.titleFace.mesh);
+
+    // "Add song" is always available; it is the first thing you press.
+    d.add = new Button({ w: 1.5, h: 0.36, color: css, label: `Add song ${id}`, solid: true, onPress: () => cb.onAdd(id) });
+    d.add.group.position.set(0, 0.6, 0.01); g.add(d.add.group);
+
+    // Everything below rises out of the deck after a song is loaded.
+    d.cg = new THREE.Group(); g.add(d.cg);
+    const act = () => d.reveal > 0.9;
+    d.play = new Button({ w: 1.5, h: 0.4, color: css, label: 'Play', onPress: () => cb.onPlay(id), isActive: act });
+    d.play.group.position.set(0, 0.15, 0.01); d.cg.add(d.play.group);
+
+    const volCap = new Caption(0.5, 0.36), pitchCap = new Caption(0.5, 0.36), filtCap = new Caption(0.5, 0.36);
+    volCap.mesh.position.set(-0.5, -1.7, 0.01); pitchCap.mesh.position.set(0, -1.7, 0.01); filtCap.mesh.position.set(0.5, -1.7, 0.01);
+    d.cg.add(volCap.mesh, pitchCap.mesh, filtCap.mesh);
+
+    d.vol = new Slider({ axis: 'y', length: 1.2, color: col, value: 0.85, def: 0.85, isActive: act,
+      onChange: (v) => { cb.onVolume(id, v); volCap.set('Volume', Math.round(v * 100) + '%'); } });
+    d.vol.group.position.set(-0.5, -0.8, 0.01); d.cg.add(d.vol.group);
+
+    d.pitch = new Slider({ axis: 'y', length: 1.2, color: col, value: 0.5, def: 0.5, fill: false, ticks: [0.5], isActive: act,
+      onChange: (v) => {
+        const rate = 0.84 + v * 0.32, pct = (rate - 1) * 100;       // +/-16% like a turntable
+        cb.onPitch(id, rate); pitchCap.set('Pitch', (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%');
+      } });
+    d.pitch.group.position.set(0, -0.8, 0.01); d.cg.add(d.pitch.group);
+
+    d.filter = new Knob({ radius: 0.2, color: col, value: 0.5, def: 0.5, isActive: act,
+      onChange: (v) => {
+        const f = v * 2 - 1; cb.onFilter(id, f);
+        filtCap.set('Filter', Math.abs(f) < 0.04 ? 'Off' : f < 0 ? 'Low-pass' : 'High-pass');
+      } });
+    d.filter.group.position.set(0.5, -0.8, 0.01); d.cg.add(d.filter.group);
+
+    // API used by the app glue
+    d.setTitle = (t) => { d.title = t; d.dirty = true; };
+    d.setLoaded = (b) => { d.loaded = b; d.dirty = true; };
+    d.setPlaying = (b) => { d.playing = b; d.play.set({ label: b ? 'Pause' : 'Play', solid: b }); };
+    d.setProgress = (p) => { if (Math.abs(p - d.progress) > 0.004) { d.progress = p; d.dirty = true; } };
+    d.setLevel = (l) => { d.level += (l - d.level) * 0.4; };
+    d.setRate = (r) => { d.rate = r; };
+    d.cg.visible = false;
+  }
+
+  function paintTitle(d) {
+    d.dirty = false; d._tp = performance.now();
+    d.titleFace.paint((cx, pw, ph) => {
+      cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.fillStyle = d.loaded ? '#ffffff' : '#a3a9d6';
+      cx.font = `600 ${Math.round(ph * 0.4)}px ${FONT_BODY}`;
+      cx.fillText(ellipsize(cx, d.title, pw * 0.94), pw / 2, ph * 0.36);
+      const bx = pw * 0.06, bw = pw * 0.88, by = ph * 0.82, bh = Math.max(3, ph * 0.06);
+      cx.fillStyle = 'rgba(255,255,255,0.14)'; rr(cx, bx, by, bw, bh, bh / 2); cx.fill();
+      if (d.loaded && d.progress > 0) { cx.fillStyle = CSSC[d.id]; rr(cx, bx, by, Math.max(bh, bw * d.progress), bh, bh / 2); cx.fill(); }
+    });
+  }
+
+  /* ---------- scene setup ---------- */
+  function init(canvasEl, callbacks) {
+    cb = callbacks;
+    renderer = new THREE.WebGLRenderer({ canvas: canvasEl, alpha: true, antialias: true });   // alpha: camera video shows through
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x000000, 0);
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    camera.updateMatrixWorld();
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(1, 3, 2); scene.add(sun);
+
+    root = new THREE.Group(); scene.add(root);
+    const lA = new THREE.PointLight(COLOR.A, 0.9, 6); lA.position.set(-1, 1.5, 1.8); root.add(lA);
+    const lB = new THREE.PointLight(COLOR.B, 0.9, 6); lB.position.set(1, 1.5, 1.8); root.add(lB);
+
+    // Body of the deck. Slightly see-through so the real room shows around the controls.
+    const panelGeo = new THREE.BoxGeometry(W, H, 0.2);
+    const panel = new THREE.Mesh(panelGeo, new THREE.MeshStandardMaterial({ color: 0x14173a, metalness: 0.25, roughness: 0.55, transparent: true, opacity: 0.93 }));
+    panel.position.z = -0.1; panel.renderOrder = -10; root.add(panel);   // renderOrder: draw the see-through body first, so labels are never washed out by it
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(panelGeo), new THREE.LineBasicMaterial({ color: 0x7a82c8, transparent: true, opacity: 0.55 }));
+    edges.position.z = -0.1; edges.renderOrder = -9; root.add(edges);
+    const vDiv = new THREE.Mesh(new THREE.BoxGeometry(0.014, 4.6, 0.012), new THREE.MeshBasicMaterial({ color: 0x2a3066 })); vDiv.position.set(0, 0.4, 0.006); root.add(vDiv);
+    const hDiv = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.014, 0.012), new THREE.MeshBasicMaterial({ color: 0x2a3066 })); hDiv.position.set(0, -1.98, 0.006); root.add(hDiv);
+
+    buildDeck('A', -0.95);
+    buildDeck('B', 0.95);
+
+    // Crossfader (amber: it belongs to neither deck). Appears once any song is loaded.
+    xf = { reveal: 0 };
+    xf.group = new THREE.Group(); xf.group.position.set(0, -2.3, 0.01); root.add(xf.group);
+    const xfCap = new Caption(1.4, 0.3); xfCap.mesh.position.set(0, -0.34, 0); xf.group.add(xfCap.mesh);
+    xf.slider = new Slider({ axis: 'x', length: 2.5, color: 0xffc857, value: 0.5, def: 0.5, fill: false, ticks: [0.5], handle: [0.22, 0.4],
+      isActive: () => xf.reveal > 0.9,
+      onChange: (v) => { cb.onCrossfade(v); xfCap.set('Crossfader', v < 0.46 ? 'Mostly A' : v > 0.54 ? 'Mostly B' : 'Center'); } });
+    xf.group.add(xf.slider.group);
+    ['A', 'B'].forEach((id, i) => {
+      const f = new Face(0.3, 0.3, 200);
+      f.paint((cx, pw, ph) => { cx.fillStyle = CSSC[id]; cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.font = `700 ${Math.round(ph * 0.6)}px ${FONT_DISPLAY}`; cx.fillText(id, pw / 2, ph / 2 + 2); });
+      f.mesh.position.set(i ? 1.62 : -1.62, 0, 0); xf.group.add(f.mesh);
+    });
+    xf.group.visible = false;
+
+    // The 3D hand cursor (ring + dot) and a faint "shadow" on the deck so you can judge where it will land.
+    cursor = new THREE.Group();
+    cursorMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.95, depthTest: false, side: THREE.DoubleSide });
+    const ringM = new THREE.Mesh(new THREE.RingGeometry(0.1, 0.135, 40), cursorMat);
+    const dotM = new THREE.Mesh(new THREE.CircleGeometry(0.03, 20), cursorMat);
+    ringM.renderOrder = 999; dotM.renderOrder = 999;
+    cursor.add(ringM, dotM); cursor.visible = false; scene.add(cursor);
+    shadow = new THREE.Mesh(new THREE.RingGeometry(0.08, 0.12, 32), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25, depthTest: false, side: THREE.DoubleSide }));
+    shadow.renderOrder = 998; shadow.visible = false; scene.add(shadow);
+
+    window.addEventListener('resize', resize);
+    window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+    resize();
+    ['A', 'B'].forEach((id) => paintTitle(decks[id]));
+    // Push default fader positions into the audio engine.
+    ['A', 'B'].forEach((id) => { const d = decks[id]; d.vol.setValue(d.vol.value); d.pitch.setValue(d.pitch.value); d.filter.setValue(d.filter.value); });
+    xf.slider.setValue(xf.slider.value);
+    scene.updateMatrixWorld(true);
+  }
+
+  function resize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+    fit();
+  }
+  // Move the deck back until all four corners sit inside the screen (portrait or landscape), then
+  // centre it in the free band between the top status chip and the bottom hint.
+  function fit() {
+    const hw = W / 2, hh = H / 2, TOP = 0.82, BOTTOM = -0.9, SIDE = 0.95;
+    const corners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    const tanV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+    const v = new THREE.Vector3();
+    const bounds = (d, y) => {
+      root.position.set(0, y, -d); root.rotation.set(TILT, 0, 0); root.updateMatrixWorld(true);
+      let maxX = 0, minY = 9, maxY = -9;
+      corners.forEach(([x, yy]) => { v.set(x, yy, 0).applyMatrix4(root.matrixWorld).project(camera); maxX = Math.max(maxX, Math.abs(v.x)); minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y); });
+      return { maxX, minY, maxY };
+    };
+    let d = 10, y = 0;
+    for (let i = 0; i < 12; i++) {
+      const b = bounds(d, y);
+      d *= Math.max(b.maxX / SIDE, (b.maxY - b.minY) / (TOP - BOTTOM));     // approx: size on screen is proportional to 1/d
+      const nb = bounds(d, y);
+      y += (((TOP + BOTTOM) / 2) - (nb.minY + nb.maxY) / 2) * d * tanV;     // slide into the middle of the free band
+    }
+    bounds(d, y);
+    planeNormalW.set(0, 0, 1).applyQuaternion(root.quaternion);
+    plane.setFromNormalAndCoplanarPoint(planeNormalW, root.position);
+    shadow.quaternion.copy(root.quaternion);
+  }
+
+  // Ray from the camera through a screen point (NDC -1..1).
+  // Returns the point where it meets the deck's top surface and the control under it, if any.
+  function pickAt(ndc) {
+    raycaster.setFromCamera(ndc, camera);
+    const pt = new THREE.Vector3();
+    const world = raycaster.ray.intersectPlane(plane, pt) ? pt : null;
+    for (const h of raycaster.intersectObjects(hitMeshes, false)) {
+      const c = h.object.userData.control;
+      if (c.isActive()) return { control: c, world: world || h.point.clone() };
+    }
+    return { control: null, world };
+  }
+
+  function setCursor(c) {
+    if (!c || !c.world) { cursor.visible = false; shadow.visible = false; return; }
+    // z from the player lifts the ring a little; pinching drops it onto the deck.
+    const lift = c.pinch ? 0.03 : clamp(0.1 - (c.z || 0) * 0.5, 0.05, 0.25);
+    cursor.visible = true; shadow.visible = true;
+    cursor.position.copy(c.world).addScaledVector(planeNormalW, lift);
+    shadow.position.copy(c.world).addScaledVector(planeNormalW, 0.03);
+    const target = (c.pinch ? 0.65 : 1) * clamp(0.75 + (c.s || 0.2) * 1.6, 0.8, 1.3);
+    cursorScale += (target - cursorScale) * 0.3;
+    cursor.scale.setScalar(cursorScale);
+    cursorMat.color.setHex(c.pinch ? 0xffc857 : 0xffffff);
+  }
+
+  function update(dt) {
+    const now = performance.now();
+    let any = false;
+    for (const id in decks) {
+      const d = decks[id];
+      if (d.loaded) any = true;
+      d.reveal += ((d.loaded ? 1 : 0) - d.reveal) * (1 - Math.exp(-dt * 8));
+      d.cg.visible = d.reveal > 0.02;
+      d.cg.position.z = -(1 - d.reveal) * 0.4;                  // controls rise out of the deck
+      if (d.playing) { d.spin -= dt * 3.49 * d.rate; d.spinGroup.rotation.z = d.spin; }   // 33 1/3 rpm
+      d.ring.material.emissiveIntensity = 0.3 + d.level * 2.4;  // ring pulses with the music
+      if (d.dirty && now - d._tp > 90) paintTitle(d);
+    }
+    xf.reveal += ((any ? 1 : 0) - xf.reveal) * (1 - Math.exp(-dt * 8));
+    xf.group.visible = xf.reveal > 0.02;
+    xf.group.position.z = 0.01 - (1 - xf.reveal) * 0.4;
+  }
+  function render() { renderer.render(scene, camera); }
+  function repaintAll() { faces.forEach((f) => f.redraw()); }
+
+  return { init, update, render, pickAt, setCursor, repaintAll, controls, deck: (id) => decks[id] };
+})();
+
+/* ==========================================================================
+   6. INPUT - one pointer model for hand + touch + mouse
+   --------------------------------------------------------------------------
+   Every source becomes a "pointer": { ndc, world, down, control }.
+     press()   -> pointer goes down on whatever control is under it
+     move()    -> updates the deck-surface point and drags the held control
+     release() -> lets go
+   The hand pointer is fed by packets from the player and smoothed with an
+   adaptive lerp. Touch pointers come straight from pointer events.
+   ========================================================================== */
+const Input = (() => {
+  const pointers = new Map();
+  let mouseHover = null;
+  const mk = (id, kind) => ({ id, kind, fire: kind === 'hand' ? 'down' : 'up', ndc: new THREE.Vector2(), world: new THREE.Vector3(), down: false, control: null, hover: null });
+  const hand = { present: false, pinch: false, prevPinch: false, target: new THREE.Vector2(), ndc: new THREE.Vector2(), z: 0, s: 0.2, lastSeen: 0, ptr: mk('hand', 'hand') };
+  // "Stable hover" forgives the small cursor drift that happens while your fingers close for a pinch.
+  let stable = null, stableT = 0, cand = null, candSince = 0;
+  let onUse = () => {};
+  const domCursor = $('dom-cursor');
+
+  function press(p) {
+    const r = Mixer3D.pickAt(p.ndc);
+    let c = r.control;
+    if (!c && p.kind === 'hand' && stable && performance.now() - stableT < 200) c = stable;
+    if (r.world) p.world.copy(r.world);
+    p.down = true; p.control = c; p.hover = c;
+    if (c) c.down(p.world, p);
+  }
+  function move(p) {
+    const r = Mixer3D.pickAt(p.ndc);
+    if (r.world) p.world.copy(r.world);
+    p.hover = r.control;
+    if (p.down && p.control) p.control.drag(p.world, p);
+  }
+  function release(p) { if (p.control) p.control.up(p); p.down = false; p.control = null; }
+
+  /* ---- hand packets from NET ---- */
+  function onHandPacket(d) {
+    if (!d.p) { hand.present = false; hand.pinch = false; return; }
+    const z = CONFIG.zone;
+    const ux = clamp((d.x - z.x0) / (z.x1 - z.x0), 0, 1), uy = clamp((d.y - z.y0) / (z.y1 - z.y0), 0, 1);
+    hand.target.set(ux * 2 - 1, 1 - uy * 2);          // camera-frame 0..1 -> screen NDC -1..1
+    hand.pinch = !!d.k; hand.z = d.z || 0; hand.s = d.s || 0.2; hand.lastSeen = performance.now();
+    if (!hand.present) { hand.present = true; hand.ndc.copy(hand.target); }   // snap on first sight, do not fly in
+  }
+
+  /* ---- per frame ---- */
+  function update(dt) {
+    const now = performance.now();
+    const h = hand;
+    if (h.present && now - h.lastSeen > CONFIG.handTimeoutMs) { h.present = false; h.pinch = false; }
+    const modal = Library.isOpen();
+    let cursorState = null;
+
+    if (!h.present) {
+      if (h.ptr.down) release(h.ptr);
+      h.ptr.hover = null; h.prevPinch = false; domCursor.hidden = true;
+    } else {
+      // Adaptive lerp: smoothing rate grows with distance, so small tremors are filtered but fast moves keep up.
+      const dx = h.target.x - h.ndc.x, dy = h.target.y - h.ndc.y;
+      const rate = CONFIG.smoothing.min + CONFIG.smoothing.gain * Math.hypot(dx, dy);
+      const a = 1 - Math.exp(-rate * dt);
+      h.ndc.x += dx * a; h.ndc.y += dy * a;
+      h.ptr.ndc.copy(h.ndc);
+      const edge = h.pinch && !h.prevPinch;
+      h.prevPinch = h.pinch;
+
+      if (modal) {
+        // While the song picker is open, the hand drives a flat DOM cursor and a pinch "clicks" the DOM element under it.
+        if (h.ptr.down) release(h.ptr);
+        const px = (h.ndc.x + 1) / 2 * innerWidth, py = (1 - h.ndc.y) / 2 * innerHeight;
+        domCursor.hidden = false;
+        domCursor.style.transform = `translate(${px}px,${py}px) scale(${h.pinch ? 0.65 : 1})`;
+        Library.hover(px, py);
+        if (edge && now - Library.openedAt() > 500) Library.click(px, py);
+      } else {
+        domCursor.hidden = true;
+        move(h.ptr);
+        // track the control we have hovered steadily for 100 ms
+        if (h.ptr.hover !== cand) { cand = h.ptr.hover; candSince = now; }
+        if (cand && now - candSince > 100) { stable = cand; stableT = now; }
+        if (h.pinch && !h.ptr.down) { press(h.ptr); onUse(); }
+        else if (!h.pinch && h.ptr.down) release(h.ptr);
+        cursorState = { world: h.ptr.world, pinch: h.pinch, z: h.z, s: h.s };
+      }
+    }
+
+    // hover highlight for every control something is pointing at or holding
+    const hot = new Set();
+    if (h.present && !modal && h.ptr.hover) hot.add(h.ptr.hover);
+    if (mouseHover) hot.add(mouseHover);
+    if (h.ptr.control) hot.add(h.ptr.control);
+    for (const p of pointers.values()) if (p.control) hot.add(p.control);
+    Mixer3D.controls.forEach((c) => c.setHover(hot.has(c)));
+
+    return cursorState;
+  }
+
+  /* ---- touch / mouse on the canvas ---- */
+  function ndcFrom(e, canvas, out) {
+    const r = canvas.getBoundingClientRect();
+    out.set(((e.clientX - r.left) / r.width) * 2 - 1, -(((e.clientY - r.top) / r.height) * 2 - 1));
+  }
+  function bind(canvas) {
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+      Engine.resume();
+      const p = mk('p' + e.pointerId, e.pointerType === 'mouse' ? 'mouse' : 'touch');
+      ndcFrom(e, canvas, p.ndc); pointers.set(p.id, p); press(p); onUse();
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      const p = pointers.get('p' + e.pointerId);
+      if (p) { ndcFrom(e, canvas, p.ndc); move(p); }
+      else if (e.pointerType === 'mouse') { const t = new THREE.Vector2(); ndcFrom(e, canvas, t); mouseHover = Mixer3D.pickAt(t).control; }
+    });
+    const end = (e) => {
+      const p = pointers.get('p' + e.pointerId);
+      if (!p) return;
+      ndcFrom(e, canvas, p.ndc); move(p); release(p); pointers.delete(p.id);
+    };
+    canvas.addEventListener('pointerup', end);
+    canvas.addEventListener('pointercancel', end);
+  }
+
+  return { bind, update, onHandPacket, handActive: () => hand.present, set onUse(fn) { onUse = fn; } };
+})();
+
+/* ==========================================================================
+   7. NET - PeerJS client (viewer side)
+   ========================================================================== */
+const Net = (() => {
+  let peer = null, conn = null, code = '', lastRx = 0;
+  let onHand = () => {};
+
+  function cleanup() {
+    try { if (conn) conn.close(); } catch (_) {}
+    try { if (peer) peer.destroy(); } catch (_) {}
+    conn = null; peer = null;
+  }
+
+  function connect(c) {
+    code = c;
+    return new Promise((resolve, reject) => {
+      cleanup();
+      const p = new Peer({ debug: 1, config: { iceServers: CONFIG.iceServers } });   // viewer gets a random id from the broker
+      peer = p;
+      let settled = false;
+      const fail = (msg) => { if (settled) return; settled = true; clearTimeout(timer); try { p.destroy(); } catch (_) {} reject(new Error(msg)); };
+      const timer = setTimeout(() => fail('Could not reach the player phone. Check the code, and that both phones are online.'), 15000);
+
+      p.on('error', (err) => {
+        if (err.type === 'peer-unavailable') fail('No player phone found with that code.');
+        else fail(`Connection problem (${err.type}).`);
+      });
+      p.on('open', () => {
+        const dc = p.connect(CONFIG.peerPrefix + c, { reliable: false, serialization: 'json' });
+        conn = dc;
+        dc.on('open', () => {
+          if (settled) return;
+          settled = true; clearTimeout(timer); lastRx = performance.now();
+          try { dc.send({ t: 'hello' }); } catch (_) {}
+          resolve();
+        });
+        dc.on('data', (d) => { lastRx = performance.now(); if (d && d.t === 'hand') onHand(d); });
+      });
+    });
+  }
+  // "Open" also requires recent traffic: the player pings once a second, so 6 s of silence means the link is dead
+  // even if the browser has not yet noticed (WebRTC can take 30 s+ to time out a vanished phone).
+  const isOpen = () => !!(conn && conn.open && performance.now() - lastRx < 6000);
+  return { connect, isOpen, code: () => code, set onHand(fn) { onHand = fn; } };
+})();
+
+/* ==========================================================================
+   8. LIBRARY - the "add song" modal
+   --------------------------------------------------------------------------
+   Sources:  built-in synthesized loops  |  Jamendo search (optional)
+             |  any audio file from the phone
+   NOTE: YouTube cannot be used here. Its audio lives in a cross-origin iframe
+   that the Web Audio API is not allowed to touch, so it could not go through
+   the crossfader and filters.
+   ========================================================================== */
+const Library = (() => {
+  const el = $('modal'), list = $('m-list'), input = $('m-search');
+  let target = 'A', openedAtMs = 0, hot = null, remote = [], searchTimer = 0;
+  const cache = new Map();
+
+  const isOpen = () => !el.hidden;
+
+  function songHtml(kind, id, title, meta) {
+    return `<button class="song" data-hand data-kind="${kind}" data-id="${esc(id)}">
+      <span class="swatch"></span>
+      <span><span class="song-title">${esc(title)}</span><span class="song-meta">${esc(meta)}</span></span>
+      <span class="song-act">Add to ${target}</span></button>`;
+  }
+  function render() {
+    const q = input.value.trim().toLowerCase();
+    const built = Synth.TRACKS.filter((t) => !q || (t.title + ' ' + t.genre).toLowerCase().includes(q));
+    let html = '';
+    if (built.length) html += '<h4>Built-in loops</h4>' + built.map((t) => songHtml('built', t.id, t.title, `${t.genre}, ${t.bpm} BPM`)).join('');
+    if (remote.length) html += '<h4>Jamendo results</h4>' + remote.map((r) => songHtml('remote', r.id, r.title, r.artist)).join('');
+    if (!built.length && !remote.length) html += `<p class="empty">No songs match "${esc(q)}". Clear the search, or choose a file from this phone.</p>`;
+    list.innerHTML = html;
+    list.style.setProperty('--c', target === 'A' ? 'var(--a)' : 'var(--b)');
+  }
+
+  function open(deckId) {
+    target = deckId; remote = [];
+    $('m-title').textContent = `Add a song to Deck ${deckId}`;
+    input.value = ''; render();
+    el.hidden = false; openedAtMs = performance.now();
+  }
+  function close() { el.hidden = true; if (hot) hot.classList.remove('hot'); hot = null; }
+
+  // Load a song into the target deck, with progress shown on the deck's own title strip.
+  async function run(label, task, title, loop) {
+    const id = target; close();
+    const d = Mixer3D.deck(id);
+    d.setTitle(label);
+    try {
+      const buf = await task();
+      Engine.deck(id).load(buf, title, loop);
+      d.setLoaded(true); d.setTitle(title);
+      toast(`${title} is on Deck ${id}. Press Play.`);
+    } catch (e) {
+      console.error(e);
+      const a = Engine.deck(id);
+      d.setTitle(a.buffer ? a.title : 'No song yet');
+      toast('Could not load that song. ' + (e && e.message ? e.message : ''), 4200);
+    }
+  }
+
+  async function searchJamendo(q) {
+    if (!CONFIG.jamendoClientId || q.length < 2) return [];
+    const url = 'https://api.jamendo.com/v3.0/tracks/?client_id=' + encodeURIComponent(CONFIG.jamendoClientId) +
+      '&format=json&limit=10&audioformat=mp32&search=' + encodeURIComponent(q);
+    const res = await fetch(url);
+    const j = await res.json();
+    return (j.results || []).map((t) => ({ id: 'jm' + t.id, title: t.name, artist: t.artist_name, url: t.audio }));
+  }
+
+  list.addEventListener('click', (e) => {
+    const b = e.target.closest('.song');
+    if (!b) return;
+    if (b.dataset.kind === 'built') {
+      const def = Synth.TRACKS.find((t) => t.id === b.dataset.id);
+      run(`Rendering ${def.title}`, async () => {
+        if (!cache.has(def.id)) cache.set(def.id, await Synth.render(def));
+        return cache.get(def.id);
+      }, def.title, true);
+    } else {
+      const item = remote.find((r) => r.id === b.dataset.id);
+      run(`Loading ${item.title}`, async () => {
+        const res = await fetch(item.url);              // fails if the host does not send CORS headers
+        if (!res.ok) throw new Error('The music host refused the request.');
+        return Engine.decode(await res.arrayBuffer());
+      }, item.title, false);
+    }
+  });
+
+  input.addEventListener('input', () => {
+    render();
+    clearTimeout(searchTimer);
+    if (CONFIG.jamendoClientId) {
+      searchTimer = setTimeout(async () => {
+        try { remote = await searchJamendo(input.value.trim()); render(); } catch (_) { /* offline: built-in list still works */ }
+      }, 350);
+    }
+  });
+  $('m-close').addEventListener('click', close);
+  el.addEventListener('click', (e) => { if (e.target === el) close(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && isOpen()) close(); });
+  $('m-upload').addEventListener('click', () => $('m-file').click());
+  $('m-file').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    run(`Decoding ${f.name}`, async () => Engine.decode(await f.arrayBuffer()), f.name.replace(/\.[^.]+$/, ''), false);
+  });
+
+  // Hand control inside the modal: the player's pinch "clicks" whatever [data-hand] element is under the cursor.
+  const under = (px, py) => { const n = document.elementFromPoint(px, py); return n && n.closest ? n.closest('[data-hand]') : null; };
+  function hover(px, py) {
+    const t = under(px, py);
+    if (t !== hot) { if (hot) hot.classList.remove('hot'); hot = t; if (hot) hot.classList.add('hot'); }
+  }
+  function click(px, py) {
+    const t = under(px, py);
+    if (!t) return;
+    haptic(14); t.click(); if (t.tagName === 'INPUT') t.focus();
+  }
+  return { open, isOpen, hover, click, openedAt: () => openedAtMs };
+})();
+
+/* ==========================================================================
+   9. VIEWER - glue and the render loop
+   ========================================================================== */
+const Viewer = (() => {
+  let mode = 'touch', inited = false, hintGone = false, lastT = performance.now();
+
+  function hideHint() { if (!hintGone) { hintGone = true; $('v-hint').classList.add('gone'); } }
+
+  function hud() {
+    const s = $('v-status'), d = $('v-dot');
+    if (mode === 'touch') { s.textContent = 'Touch mode'; d.className = 'dot'; $('v-reconnect').hidden = true; return; }
+    if (!Net.isOpen()) { s.textContent = 'Player disconnected'; d.className = 'dot bad'; $('v-reconnect').hidden = false; return; }
+    $('v-reconnect').hidden = true;
+    if (Input.handActive()) { s.textContent = 'Hand tracked'; d.className = 'dot ok'; }
+    else { s.textContent = 'Connected, waiting for a hand'; d.className = 'dot wait'; }
+  }
+
+  async function backdrop() {
+    const v = $('v-video'), scr = $('screen-viewer');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+      v.srcObject = stream; await v.play();
+      scr.classList.remove('no-cam');
+    } catch (e) {
+      scr.classList.add('no-cam');
+      toast('Camera not available, so the deck is shown on a plain background.', 3600);
+    }
+  }
+
+  function loop(now) {
+    requestAnimationFrame(loop);
+    const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+    const cursor = Input.update(dt);
+    Engine.tick();
+    ['A', 'B'].forEach((id) => {
+      const a = Engine.deck(id), d = Mixer3D.deck(id);
+      d.setProgress(a.progress()); d.setLevel(a.level()); d.setRate(a.rate);
+    });
+    Mixer3D.setCursor(cursor);
+    Mixer3D.update(dt);
+    Mixer3D.render();
+  }
+
+  async function enter(m) {
+    mode = m;
+    show('screen-viewer');
+    if (!inited) {
+      inited = true;
+      const canvas = $('v-canvas');
+      Mixer3D.init(canvas, {
+        onAdd: (id) => Library.open(id),
+        onPlay: (id) => { Engine.resume(); Engine.deck(id).toggle(); },
+        onVolume: (id, v) => Engine.deck(id).setVolume(v),
+        onPitch: (id, r) => Engine.deck(id).setRate(r),
+        onFilter: (id, f) => Engine.deck(id).setFilter(f),
+        onCrossfade: (v) => Engine.setCrossfade(v)
+      });
+      ['A', 'B'].forEach((id) => { Engine.deck(id).onChange = () => Mixer3D.deck(id).setPlaying(Engine.deck(id).playing); });
+      Input.bind(canvas);
+      Input.onUse = hideHint;
+      Net.onHand = Input.onHandPacket;
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => Mixer3D.repaintAll());
+      requestAnimationFrame(loop);
+      setInterval(hud, 300);
+    }
+    hud();
+    backdrop();
+  }
+  return { enter };
+})();
+
+/* ==========================================================================
+   10. BOOT - wire up the buttons
+   ========================================================================== */
+$('btn-player').addEventListener('click', () => Player.start());
+$('btn-viewer').addEventListener('click', () => show('screen-join'));
+$('join-back').addEventListener('click', () => show('screen-role'));
+$('v-exit').addEventListener('click', leave);
+
+const codeInput = $('join-code'), joinMsg = $('join-msg');
+function say(msg, bad) { joinMsg.textContent = msg; joinMsg.classList.toggle('bad', !!bad); }
+codeInput.addEventListener('input', () => { codeInput.value = codeInput.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
+codeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('join-go').click(); });
+
+$('join-go').addEventListener('click', async () => {
+  const code = codeInput.value.trim();
+  if (code.length !== CONFIG.codeLength) { say(`The code has ${CONFIG.codeLength} characters.`, true); return; }
+  Engine.init();                                   // must happen inside this tap so the browser allows audio
+  say('Connecting');
+  $('join-go').disabled = true;
+  try { await Net.connect(code); say(''); Viewer.enter('paired'); }
+  catch (err) { say(err.message, true); }
+  finally { $('join-go').disabled = false; }
+});
+$('join-demo').addEventListener('click', () => { Engine.init(); Viewer.enter('touch'); });
+$('v-reconnect').addEventListener('click', async () => {
+  Engine.resume();
+  toast('Reconnecting');
+  try { await Net.connect(Net.code()); toast('Player connected again.'); }
+  catch (err) { toast(err.message, 4200); }
+});
+document.addEventListener('pointerdown', () => Engine.resume(), { passive: true });
+
+// Scanning the player's QR code opens ?join=CODE: jump straight to the pairing screen with the code filled in.
+const joinParam = new URLSearchParams(location.search).get('join');
+if (joinParam) { codeInput.value = joinParam.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, CONFIG.codeLength); show('screen-join'); }
+
+})();
+</script>
+</body>
+</html>
